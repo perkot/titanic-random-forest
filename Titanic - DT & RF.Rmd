@@ -1,0 +1,1239 @@
+---
+title: "Predicting survival on the Titanic - Decision Tree & Random Forest"
+author: "Tom Perkins"
+date: "04/03/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## 1.Clean & Visualise 
+
+### The Data
+
+The below kernel summarises an approach I took to the infamous Titanic challenge
+
+A number of predictive techniques are implemented, comparing cross-validated results to submission results:
+
+- Decision Trees
+- Conditional Inference Trees
+- Random Forest
+- Support Vector Machines
+
+### Data set-up
+
+First, lets load-in our dependencies :
+
+```{r Load dependencies, results='hide', message=FALSE, warning=FALSE}
+library(plyr) # means
+library(dplyr) # data-cleaning
+library(stringr) # data-cleaning
+library(naniar) # missing data visualisation
+library(ggplot2) # visualising predictors
+library(rpart) # decision trees
+library(rattle) # visualise decision trees
+library(rpart.plot) # visualise decision trees
+library(randomForest) # random forests
+library(recipes) # random forests
+library(caret) # model tuning
+library(caTools) # cross validation 
+library(pROC) # ROC curves
+library(RColorBrewer)
+library(Hmisc)
+library(kableExtra) # markdown tables 
+```
+
+Then load in our train & test data-sets
+
+```{r load data, results='hide', message=FALSE, warning=FALSE}
+# Read in .csv files
+train <- read.csv("train.csv")
+test <- read.csv("test.csv")
+
+# Create survived column in test set
+test$Survived <- NA
+# Bind test and train data to create new variables in both sets
+combined <- rbind(train, test)
+# Check data
+str(combined)
+
+```
+
+### Data Cleaning
+
+Let's first examine which variables are missing data
+
+```{r missing data}
+# Convert all blanks to NA
+combined[combined==""]  <- NA 
+# Check our missing data situation 
+miss <- sapply(combined[-2], function(x) sum(is.na(x)))
+```
+
+```{r missing data vis, echo = FALSE, warning=FALSE}
+kable(miss) %>% 
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive", font_size = 8))
+
+# Visualise missing values
+# Cabin missing > 70% of data
+# Age missing ~ 20% of data
+Miss1 <- gg_miss_fct(x = combined[-2], fct = Sex)
+Miss1
+```
+
+"Age" & "Cabin" are missing significant amounts of data, with a slightly higher proportion of cabin details missing for males
+
+We can check whether missing cabin information is spread evenly across passenger "class"
+
+```{r missing data 2, echo = FALSE, warning=FALSE}
+# Visualise missing values in cabin more closely
+Miss2 <- gg_miss_fct(x = combined[-2], fct = Pclass)
+Miss2
+```
+
+Perhaps unsuprisingly, there is more missing information in the lower classes. I'm going to presume better historical records are maintained for affluent passengers 
+
+Let's examine missing data for Cabin x SibSp (i.e. number of siblings)
+
+```{r missing data 3, echo = FALSE, warning=FALSE}
+# Visualise missing values in cabin more closely
+Miss3 <- gg_miss_fct(x = combined[-2], fct = SibSp)
+Miss3
+```
+
+Missing data for Cabin appears to rise as SibSp rises (i.e. more siblings == more missing data). This may suggest a systematic bias in record keeping of higher-occupancy cabins.
+
+Generally, a feature with this much missing is a lost cause, & risks significantly biasing a model. Potentially a feature could be extracted utilising cabin details for first class passengers as this data is more complete. However, I opted not to proceed further with this variable
+
+Passenger's age has ~ 20% missing data, & therefore is suitable for missing value imputation. Below I have fitted a decision tree to predict missing values, utilising other variables as predictors of missing values. A decision tree was Previous favored over linear regression as previous attempts were sub-optimal, producing negative age values
+
+``` {r missing data 4, include=TRUE, results="hide" }
+# Use a decision tree to predict missing values
+# Create DF with missing age values removed 
+NoMissing <- combined %>% filter(!is.na(Age))
+# Create a predictive model for age
+fit.missing <- rpart(Age ~ Pclass + Sex + SibSp + Parch + Fare + Embarked, 
+                  data = NoMissing)
+# Examine the model 
+summary(fit.missing)
+# Examine the coefficients
+fit.missing
+# Create 'age predicted' column from fit.missing, into initial data-set
+combined <- combined %>% 
+  mutate(age.predicted = predict(fit.missing, .)) %>% 
+  # Replace NAs in combinedd$Age, with age.predicted 
+  mutate(Age = ifelse(is.na(Age), age.predicted, Age))
+# Remove predicted age column 
+combined$age.predicted <- NULL
+print(fit.missing)
+
+# Replace any values below 1 with 1 to keep consistent with age-data
+combined$Age[combined$Age < 1] <- 1
+```
+
+A small number of data-points were missing from port of embarkment, which have been corrected 
+
+```{r missing data 5}
+# replace missing embarked values
+combined$Embarked[c(62,830)] = "S"
+combined$Embarked <- factor(combined$Embarked)
+```
+
+With one missing fare value, we can safely replace this with the median without biasing our model 
+
+```{r missing data 6}
+# replace missing fare value 
+combined$Fare[1044] <- median(combined$Fare, na.rm = TRUE)
+```
+
+Finally, I have made some corrections to some implausible values that previous kernels have identified
+
+```{r missing data 7}
+# Data-set errors
+# The following fixes SibSp/Parch values for two passengers (Id=280 and Id=1284) according to this kernel 
+# because a 16 year old can’t have a 13 year old son! 
+
+combined$SibSp[combined$PassengerId == 280] = 0
+combined$Parch[combined$PassengerId == 280] = 2
+combined$SibSp[combined$PassengerId == 1284] = 1
+combined$Parch[combined$PassengerId == 1284] = 1
+```
+
+### Data exploration and visualisation 
+
+The below section utilises density plots to visualise the relationships between various predictors of survival 
+
+```{r plot theme, echo = FALSE }
+# Stacked bar chart theme
+stackedbar <- 
+  theme_minimal() +
+  theme(legend.title = element_blank()) +
+  theme(axis.line = element_line(size= 0.5, colour = "black"),
+        panel.grid.major = element_line(colour = "#d3d3d3"), 
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(), 
+        panel.background = element_blank()) +
+  theme(plot.title = element_text(size = 14, face = "bold"),
+        axis.text.x=element_text(colour="black", size = 10),
+        axis.text.y=element_text(colour="black", size = 10),
+        axis.title.x = element_text(vjust = -1, size = 10, face = "bold"),
+        axis.title.y = element_text(vjust = 2, size = 10, face = "bold")) # move title away from axis 
+```
+
+#### Survival x Age
+
+Below you can see that passengers survival status was fairly evenly distributed across the age-span of passengers, with a slightly higher density of survivors under 10 years of age
+
+```{r survival x age, echo = FALSE }
+# calculate means for plot
+means <- combined %>% 
+  ddply("Survived", summarise, grp.mean=mean(Age),
+        na.rm = TRUE)
+
+# code for plot 
+age <- combined %>% 
+  subset(!is.na(Survived)) %>%
+  ggplot(aes(Age, fill = as.factor(Survived), color = as.factor(Survived))) + 
+  geom_density(alpha = 0.2) +
+  geom_vline(data = means, 
+             aes(xintercept = grp.mean, color = as.factor(Survived)), 
+             linetype="dashed") +
+  scale_x_continuous(name = "Age") +
+  scale_y_continuous(name = "Density of cases") +
+  scale_color_manual(values=c("#C8423B", "#448A8B")) +
+  scale_fill_manual(values=c("#C8423B", "#448A8B")) +
+  theme_minimal() +
+  theme(legend.position = "right",
+        axis.title.x = element_text(vjust = -1, size = 10, face = "bold"),
+        axis.title.y = element_text(vjust = 2, size = 10, face = "bold"),
+        plot.title = element_text(vjust = 2, size = 10, face = "bold", hjust = 0.5)) + # move title away from axis 
+  labs(color = "Survived", fill = "Survived") +
+  ggtitle("Density plot of survival status x age")
+# rm means
+rm(means)
+```
+
+```{r plot1, echo=FALSE, message=FALSE, warning=FALSE}
+age
+```
+
+#### Sex x Survival
+
+Using a stacked bar chart we can visualise passengers survival status x sex
+
+Fairly clearly, 
+  (a) there were more male passengers on the titanic, & 
+  (b) survival rates were much higher for female passengers
+
+```{r sex x survival, echo = FALSE }
+# N Survived x Sex 
+survivedSBC <- combined %>% 
+  group_by(Survived, Sex) %>% 
+  dplyr::summarise(Survivors = n()) %>% 
+  subset(!is.na(Survived)) %>% # remove NA values from survive column
+  ggplot(aes(y = Survivors,
+             x = Sex, 
+             fill = as.character(Survived),
+             label = Survivors)) + 
+  geom_bar(stat="identity") +
+  geom_text(colour="white", 
+            size = 4, 
+            position = position_stack(vjust = 0.5)) +
+  scale_fill_manual(values=c("#C8423B", "#448A8B")) + 
+  scale_y_continuous(name = "Number of passengers") + 
+  stackedbar
+```
+
+```{r plot2, echo=FALSE, message=FALSE, warning=FALSE}
+survivedSBC
+```
+
+#### Sex x Age x Survival 
+
+Below are two density plots plotting passenger Age x Sex for (a) surviving passengers, & (b) non-surviving passengers
+
+```{r sex density plots, echo = FALSE }
+# Plot males versus females for survivors
+# Very similar - very young males under 10 more likely to survive than females
+means <- combined %>% 
+  filter(Survived == 1) %>% 
+  ddply("Sex", summarise, grp.mean=mean(Age))
+
+mf.survived <-
+  filter(combined, Survived == 1) %>% 
+  ggplot(aes(Age, fill = Sex, color = Sex)) + 
+  geom_density(alpha = 0.2) +
+  geom_vline(data = means, 
+             aes(xintercept = grp.mean, color = Sex), 
+             linetype="dashed") +
+  scale_x_continuous(name = "Age") +
+  scale_y_continuous(name = "Density of cases") +
+  scale_color_manual(values=c("#e041b3", "#2BAAED")) +
+  scale_fill_manual(values=c("#e041b3", "#2BAAED")) +
+  theme_minimal() +
+  theme(legend.position = "right",
+        axis.title.x = element_text(vjust = -1, size = 10, face = "bold"),
+        axis.title.y = element_text(vjust = 2, size = 10, face = "bold"),
+        plot.title = element_text(vjust = 2, size = 10, face = "bold", hjust = 0.5)) + # move title away from axis 
+  labs(color = "Sex", fill = "Sex") +
+  ggtitle("Density plot of Age x Sex for passengers who survived")
+# rm means
+rm(means)
+
+# Females < 20 more likely to die. Males > 20 generally more likely to die
+# means
+means <- combined %>% 
+  filter(Survived == 0) %>% 
+  ddply("Sex", summarise, grp.mean=mean(Age))
+# Plot males versus females for deceased
+mf.deceased <-
+  filter(combined, Survived == 0) %>% 
+  ggplot(aes(Age, fill = Sex, color = Sex)) + 
+  geom_density(alpha = 0.2) +
+  geom_vline(data = means, 
+             aes(xintercept = grp.mean, color = Sex), 
+             linetype="dashed") +
+  scale_x_continuous(name = "Age") +
+  scale_y_continuous(name = "Density of cases") +
+  scale_color_manual(values=c("#e041b3", "#2BAAED")) +
+  scale_fill_manual(values=c("#e041b3", "#2BAAED")) +
+  theme_minimal() +
+  theme(legend.position = "right",
+        axis.title.x = element_text(vjust = -1, size = 10, face = "bold"),
+        axis.title.y = element_text(vjust = 2, size = 10, face = "bold"),
+        plot.title = element_text(vjust = 2, size = 10, face = "bold", hjust = 0.5)) + # move title away from axis 
+  labs(color = "Sex", fill = "Sex") +
+  ggtitle("Density plot of Age x Sex for passengers who did not survive")
+# rm means
+rm(means)
+```
+
+For survivors, the distribution is fairly similar for males & females, with slightly more young males surviving 
+
+```{r plot3A, echo=FALSE, message=FALSE, warning=FALSE }
+mf.survived
+```
+
+For non-survivors, the distribution of age x gender is more disparate. Proportionally more females than males under 20 years of age died, whilst over the age of 20, more males died 
+
+```{r plot3B, echo=FALSE, message=FALSE, warning=FALSE }
+mf.deceased
+```
+
+#### Class x Survival
+
+There were three passengers classes on the titanic - 1, 2 & 3. Somewhat unsuprisingly, more passengers died in the poorer passenger classes
+
+```{r class x survival, echo=FALSE }
+# N Survived x Class 
+survivedSBC2 <- combined %>% 
+  group_by(Survived, Pclass) %>% 
+  dplyr::summarise(Survivors = n()) %>% 
+  subset(!is.na(Survived)) %>% # remove NA values from survive column
+  ggplot(aes(y = Survivors,
+             x = Pclass, 
+             fill = as.character(Survived),
+             label = Survivors)) + 
+  geom_bar(stat="identity") +
+  geom_text(colour="white", 
+            size = 4, 
+            position = position_stack(vjust = 0.5)) +
+  scale_fill_manual(values=c("#C8423B", "#448A8B")) + 
+  scale_y_continuous(name = "Number of passengers") + 
+  theme_minimal() +
+  stackedbar
+```
+
+```{r plot4, echo=FALSE, message=FALSE, warning=FALSE }
+survivedSBC2
+```
+
+#### Class x Age x Survival 
+
+The distribution of passenger's age for each cabin class is close to identical for survivors and non-survivors
+
+Some noteworthy differences are a higher density of surviving passengers < 10 years of age in class (2), and a higher density of non-surviving passengers > 60 in class (1)
+
+```{r class density  plots, echo=FALSE }
+# Plot class for survivors
+means <- combined %>% 
+  filter(Survived == 1) %>% 
+  ddply("Pclass", summarise, grp.mean=mean(Age))
+
+class.survived <-
+  filter(combined, Survived == 1) %>% 
+  ggplot(aes(Age, fill = as.factor(Pclass), color = as.factor(Pclass))) + 
+  geom_density(alpha = 0.2) +
+  geom_vline(data = means, 
+             aes(xintercept = grp.mean, color = as.factor(Pclass)), 
+             linetype="dashed") +
+  scale_x_continuous(name = "Age") +
+  scale_y_continuous(name = "Density of cases") +
+  scale_color_manual(values=c("#C8423B", "#D2AC41", "#4991BB")) +
+  scale_fill_manual(values=c("#C8423B", "#D2AC41", "#4991BB")) +
+  theme_minimal() +
+  theme(legend.position = "right",
+        axis.title.x = element_text(vjust = -1, size = 10, face = "bold"),
+        axis.title.y = element_text(vjust = 2, size = 10, face = "bold"),
+        plot.title = element_text(vjust = 2, size = 10, face = "bold", hjust = 0.5)) + # move title away from axis 
+  labs(color = "Class", fill = "Class") +
+  ggtitle("Density plot of Age x Class for passengers who survived")
+# rm means
+rm(means)
+
+# Plot class for deceased
+means <- combined %>% 
+  filter(Survived == 0) %>% 
+  ddply("Pclass", summarise, grp.mean=mean(Age))
+
+class.deceased <-
+  filter(combined, Survived == 0) %>% 
+  ggplot(aes(Age, fill = as.factor(Pclass), color = as.factor(Pclass))) + 
+  geom_density(alpha = 0.2) +
+  geom_vline(data = means, 
+             aes(xintercept = grp.mean, color = as.factor(Pclass)), 
+             linetype = "dashed") +
+  scale_x_continuous(name = "Age") +
+  scale_y_continuous(name = "Density of cases") +
+  scale_color_manual(values=c("#C8423B", "#D2AC41", "#4991BB")) +
+  scale_fill_manual(values=c("#C8423B", "#D2AC41", "#4991BB")) +
+  theme_minimal() +
+  theme(legend.position = "right",
+        axis.title.x = element_text(vjust = -1, size = 10, face = "bold"),
+        axis.title.y = element_text(vjust = 2, size = 10, face = "bold"),
+        plot.title = element_text(vjust = 2, size = 10, face = "bold", hjust = 0.5)) + # move title away from axis 
+  labs(color = "Class", fill = "Class") +
+  ggtitle("Density plot of Age x Class for passengers who did not survive")
+# rm means
+rm(means)
+```
+
+```{r plot5A, echo=FALSE, message=FALSE, warning=FALSE }
+class.survived
+```
+
+```{r plot5B, echo=FALSE, message=FALSE, warning=FALSE }
+class.deceased
+```
+
+#### Embarked x Survival
+
+Passengers boarded the Titanic from three ports of embarkment - Southampton, Cherbourg & Queenstown. The vast majority of passengers were from the first port of embarkment (Southampton). 
+
+There were more non-surviving Passengers embarking from Southampton & Queenstown, but more surviving passengers from Cherbourg. As such, port of embarkment appears related to survival probability 
+
+```{r embarked x survival, echo = FALSE }
+# N Survived x Embarked 
+survivedSBC3 <- combined %>% 
+  group_by(Survived, Embarked) %>% 
+  dplyr::summarise(Survivors = n()) %>% 
+  subset(!is.na(Survived)) %>%
+  subset(!is.na(Embarked)) %>%# remove NA values from survive column
+  ggplot(aes(y = Survivors,
+             x = Embarked, 
+             fill = as.character(Survived),
+             label = Survivors)) + 
+  geom_bar(stat="identity") +
+  geom_text(colour = "white", 
+            size = 3, 
+            position = position_stack(vjust = 0.5)) +
+  scale_fill_manual(values=c("#C8423B", "#448A8B")) + 
+  scale_y_continuous(name = "Number of passengers") + 
+  stackedbar
+```
+
+```{r plot6, echo=FALSE, message=FALSE, warning=FALSE }
+survivedSBC3
+```
+
+#### Embarked x Age x Survival 
+
+Density plots of port of embarkment by age show some marked differences between survivors & non-survivors
+
+For Southampton & Cherbourg passengers, a flatter age distribution is notable for survivors compared to non-survivors. Those who survived were randomly distributed across the age spectrum, compared to deceased passengers who were more concentrated around the mean age (~ 30 for these two ports).
+
+This pattern does not exist for Queenstown, with narrow age distributions observed for both survivors and non-survivors. In fact, the distribution for survivors from Queenstown is especially narrow, with all survivors being aged between 10 & 40. Non-survivors from Queenstown cover the entire age spectrum from infants through to the elderly
+
+Why this is the case is unclear. With only 77 passengers embarking from Queenstown, perhaps certain travel parties survived or died together. The surviving parties potentially having no dependents (i.e. very young children or very elderly relatives). In any case, it shows port of embarkment is potentially an important predictor
+
+```{r embarked density plots, echo = FALSE }
+# Plot class for survivors
+# Port Q - survivors were all aged between 10-40, with almost all around 30
+# nobody very old or very young survived from Port Q
+means <- combined %>% 
+  filter(Survived == 1) %>% 
+  ddply("Embarked", summarise, grp.mean=mean(Age))
+
+Embarked.survived <-
+  filter(combined, Survived == 1) %>% 
+  ggplot(aes(Age, fill = as.factor(Embarked), color = as.factor(Embarked))) + 
+  geom_density(alpha = 0.2) +
+  geom_vline(data = means, 
+             aes(xintercept = grp.mean, color = as.factor(Embarked)), 
+             linetype = "dashed") +
+  scale_x_continuous(name = "Age") +
+  scale_y_continuous(name = "Density of cases") +
+  scale_color_manual(values=c("#C8423B", "#D2AC41", "#4991BB")) +
+  scale_fill_manual(values=c("#C8423B", "#D2AC41", "#4991BB")) +
+  theme_minimal() +
+  theme(legend.position = "right",
+        axis.title.x = element_text(vjust = -1, size = 10, face = "bold"),
+        axis.title.y = element_text(vjust = 2, size = 10, face = "bold"),
+        plot.title = element_text(vjust = 2, size = 10, face = "bold", hjust = 0.5)) + # move title away from axis 
+  labs(color = "Embarked", fill = "Embarked") +
+  ggtitle("Density plot of Age x Embarkment port for passengers who survived")
+# rm means
+rm(means)
+
+# Plot class for deceased
+# Port Q - deceased aged from 0-60
+
+means <- combined %>% 
+  filter(Survived == 0) %>% 
+  ddply("Embarked", summarise, grp.mean=mean(Age))
+
+Embarked.deceased <-
+  filter(combined, Survived == 0) %>% 
+  ggplot(aes(Age, fill = as.factor(Embarked), color = as.factor(Embarked))) + 
+  geom_density(alpha = 0.2) +
+  geom_vline(data = means, 
+             aes(xintercept = grp.mean, color = as.factor(Embarked)), 
+             linetype = "dashed") +
+  scale_x_continuous(name = "Age") +
+  scale_y_continuous(name = "Density of cases") +
+  # scale_color_discrete(name = "Lender", labels = c("ML1", "ML3")) +
+  scale_color_manual(values=c("#C8423B", "#D2AC41", "#4991BB")) +
+  scale_fill_manual(values=c("#C8423B", "#D2AC41", "#4991BB")) +
+  theme_minimal() +
+  theme(legend.position = "right",
+        axis.title.x = element_text(vjust = -1, size = 10, face = "bold"),
+        axis.title.y = element_text(vjust = 2, size = 10, face = "bold"),
+        plot.title = element_text(vjust = 2, size = 10, face = "bold", hjust = 0.5)) + # move title away from axis 
+  labs(color = "Embarked", fill = "Embarked") +
+  ggtitle("Density plot of Age x Embarkment port for passengers who did not survive")
+# rm means
+rm(means)
+```
+
+```{r plot7, echo=FALSE, message=FALSE, warning=FALSE }
+Embarked.survived
+Embarked.deceased
+```
+
+### Feature Extraction 
+
+#### Title
+
+An obvious, and routinely extracted feature from the data-set is passengers title. It can be fairly simply derived via regex 
+
+```{r title }
+# change to character
+combined$Name <- as.character(combined$Name)
+
+# Extract title from passenger name
+combined$Title <- gsub("^.*, (.*?)\\..*$", "\\1", combined$Name)
+```
+
+Let's examine the breakdown of passenger titles by sex: 
+
+```{r title 2A, echo = FALSE}
+# Cross-tab frequency of each title by sex
+titletable <- table(combined$Sex, combined$Title)
+```
+
+```{r title 2B, echo=FALSE, message=FALSE, warning=FALSE }
+kable(titletable) %>% 
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive", font_size = 8))
+```
+
+Some of the rarer titles can be aggregated
+
+```{r title 3}
+# Re-assign female categories 
+combined$Title[combined$Title == 'Mlle' | combined$Title == 'Ms'] <- 'Miss' 
+combined$Title[combined$Title == 'Mme']  <- 'Mrs' 
+
+# Concatenate rare titles, potential proxi for high spcoa; standing 
+Other <- c('Dona', 'Dr', 'Lady', 'the Countess','Capt', 'Col', 'Don', 'Jonkheer', 'Major', 'Rev', 'Sir')
+
+combined$Title[combined$Title %in% Other]  <- 'Other'
+```
+
+Let's examine the breakdown ...
+
+```{r title 4, echo=FALSE, message=FALSE, warning=FALSE}
+# Examine break-down of titles 
+titletable <- table(combined$Sex, combined$Title)
+
+kable(titletable) %>% 
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive", font_size = 8))
+```
+
+Much nicer!
+
+Let's also look at the number of survivors & non-survivors by title
+
+In essence, 'title' nicely conveys some of the interactive effects of Age x Sex
+
+We know males are more likely to have died on the titanic than females, but evidently, young males with title "master" had a far better chance of survival than adult males
+
+
+```{r title 5, , echo=FALSE, message=FALSE, warning=FALSE}
+# return title to factor 
+combined$Title <- factor(combined$Title)
+
+# N Survived x Title
+# Shows again the odds of surviving as a young man better than an adult man
+survivedTitle <- combined %>% 
+  dplyr::group_by(Survived, Title) %>% 
+  dplyr::summarise(Survivors = n()) %>% 
+  subset(!is.na(Survived)) %>%
+  subset(!is.na(Title)) %>% # remove NA values from survive column
+  ggplot(aes(y = Survivors,
+             x = Title, 
+             fill = as.character(Survived),
+             label = Survivors)) + 
+  geom_bar(stat="identity") +
+  geom_text(colour="white", 
+            size = 2, 
+            position = position_stack(vjust = 0.5)) +
+  scale_fill_manual(values=c("#C8423B", "#448A8B")) + 
+  scale_y_continuous(name = "Number of passengers") + 
+  theme(legend.title = element_blank(),
+        axis.line = element_line(size = 0.5, colour = "black"),
+        panel.grid.major = element_line(colour = "#d3d3d3"), 
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(), 
+        panel.background = element_blank(),
+        # plot.title = element_text(size = 14, face = "bold"),
+        axis.text.x = element_text(colour = "black", size = 8),
+        axis.text.y = element_text(colour = "black", size = 8),
+        axis.title.x = element_text(vjust = -1, size = 10, face = "bold"),
+        axis.title.y = element_text(vjust = 2, size = 10, face = "bold"),
+        plot.title = element_text(vjust = 2, size = 10, face = "bold", hjust = 0.5)) 
+survivedTitle
+```
+
+#### Family size
+
+```{r family size }
+# Combine siblings + parents/children 
+combined$FamilySize <- combined$SibSp + combined$Parch + 1
+```
+
+#### Family unit
+
+```{r family unit }
+# Family Unit
+# Extract Surnames 
+combined$Surname <- sapply(combined$Name, 
+                           FUN=function(x) 
+                           {strsplit(x, split='[,]')[[1]][1]})
+
+# Combine with Family Size
+combined$FamilyUnit <- paste(combined$Surname, "-", combined$FamilySize)
+
+# How many unique families?
+length(unique(combined$FamilyUnit))
+```
+
+As expected there are many different family combinations ... 928 infact! This is inpractical for predictive purposes, so let's try and reduce the number of levels of this feature by combining 'small' and 'medium' sized families 
+
+``` {r family unit 2}
+# Re-code families undr 2 as 'small families'
+combined$FamilyUnit[combined$FamilySize <= 2] <- "Small"
+combined$FamilyUnit[combined$FamilySize > 2 & combined$FamilySize <= 4] <- 'Medium'
+
+# remove surname variable 
+combined$Surname <- NULL
+```
+
+Let's examine the results of combining all family sizes under 2, and between 2 & 4 people:
+
+```{r family unit 3, echo = FALSE }
+FU <- table(combined$FamilyUnit)
+kable(FU) %>% 
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive", font_size = 8))
+```
+
+Much better! 
+
+#### Age Group 
+
+```{r Age Group }
+# Age Group
+combined$AgeGroup <- NA
+combined$AgeGroup[combined$Age <= 12] <- "Child"
+combined$AgeGroup[combined$Age > 12 & combined$Age <= 18] <- "Adolescent"
+combined$AgeGroup[combined$Age > 18 & combined$Age <= 59] <- "Adult"
+combined$AgeGroup[combined$Age >= 60] <- "Elderly Adult"
+```
+
+Below is a table summarising the percentage of surviving passengers by AgeGroup & Sex
+
+Interestingly, all elderly women (arbitrarily defined as people over 60) survived. By contrast, elderly men were over-whelmingly unlikely to surive, whilst male children were slightly more likely to survive than female children. We will use this variable in some later feature engineering 
+
+```{r age group 2, echo = FALSE}
+AG <- aggregate(Survived ~ AgeGroup + Sex, 
+          data = combined, 
+          FUN = function(x) {sum(x)/length(x)})
+
+# multiply percent by 100
+AG$Survived <- AG$Survived*100
+# limit to 2 decimal places 
+AG <- AG %>% 
+  mutate_if(is.numeric, round, digits = 2)
+# create table 
+kable(AG) %>% 
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive", font_size = 8))
+```
+
+#### Travel party size
+
+Below we can approximate groups of passengers who travelled together, by extracting common string-names in the ticket, and common ticket numbers. This can be achieved by grouping passengers with commmon ticket details, aggregating the number of passengers with these ticket details, then re-combining this detail as a grouping variable with our original dataframe 
+
+```{r travel party size, include=TRUE, results="hide"}
+# Extracts out any letters before first space
+# If no letters, no extraction 
+reg.ex2 <- ".*\\s|^[A-Z].*(?![0-9])$" 
+combined$TicketPre <- str_extract(combined$Ticket, reg.ex2)
+
+# For tickets that do not begin with a character string ...
+combined$TicketPre <- gsub("\\.|\\s|/", "", combined$TicketPre)
+# Impute "_"
+combined$TicketPre[is.na(combined$TicketPre)] <- "_"
+## Convert to factor
+combined$TicketPre <- factor(combined$TicketPre)
+
+# Second half of ticket string 
+reg.ex3 <- "\\s[0-9]{1,}|^(?![A-Z]).*"
+combined$TicketNumber <- str_extract(combined$Ticket, reg.ex3)
+combined$TicketNumber[is.na(combined$TicketNumber)] <- "0"
+combined$TicketNumber <- as.numeric(combined$TicketNumber)
+combined$TicketNumber <- as.factor(combined$TicketNumber)
+
+# Based upon common ticket numbers between passengers
+# Calculate size of travel party 
+detach("package:plyr")
+library(dplyr)
+Ticket.Agg <- combined %>% 
+  group_by(TicketNumber) %>% 
+  summarise(Travel.Party.Size = n())
+
+# Convert to dataframe
+Ticket.Agg <- data.frame(Ticket.Agg)
+
+Ticket.Agg$TicketNumber <- as.factor(Ticket.Agg$TicketNumber)
+
+# Left Join
+combined <- left_join(combined, Ticket.Agg, by = "TicketNumber")
+
+# Seems highly unlikley this ticket is a travel party of 17
+# Change to 1
+combined$Travel.Party.Size[combined$TicketNumber== 2] = 1
+
+combined$TicketPre <- NULL 
+combined$TicketNumber <- NULL
+```
+
+Let's examine our breakdown of travel parties on the Titanic
+
+```{r travel party 2, echo = FALSE }
+FU <- table(combined$Travel.Party.Size)
+kable(FU) %>% 
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive", font_size = 8))
+```
+
+### Change variable types
+
+```{r factorise predictors}
+# As factor
+combined$Title <- factor(combined$Title)
+combined$AgeGroup <- factor(combined$AgeGroup)
+combined$Pclass <- factor(combined$Pclass)
+combined$FamilyUnit <- factor(combined$FamilyUnit)
+# As numeric
+combined$SibSp <- as.numeric(combined$SibSp)
+combined$Parch <- as.numeric(combined$Parch)
+combined$PassengerId <- as.numeric(combined$PassengerId)
+
+```
+
+### Feature Engineering
+
+Finally, lets create two further binary predictors, by combining a number of our existing variables
+
+Firstly, a factor variable delineating if a passenger is female, and in a travel part of more than two people 
+
+```{r feature engineering }
+# Female Group ***
+combined$Female.Group <- as.factor(ifelse(combined$Sex == "female" &
+                                          combined$Travel.Party.Size > 2, 1,0))
+```
+
+Below you can see 72% of females who travelled in groups survived
+
+```{r feature engineering 2, echo = FALSE}
+# Females with a travel party perhaps more likely to survive 
+FG <- aggregate(Survived ~ Female.Group, 
+          data = combined, 
+          FUN = function(x) {sum(x)/length(x)})
+
+# multiply percent by 100
+FG$Survived <- FG$Survived*100
+# limit to 2 decimal places 
+FG <- FG %>% 
+  mutate_if(is.numeric, round, digits = 2)
+# create table 
+kable(FG) %>% 
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive", font_size = 8))
+```
+
+Secondly, a binary predictor of males who had the title 'master' (a proxi for being a child)
+
+```{r feature engineering 3}
+# Male & Master
+combined$Master.Male <- as.factor(ifelse(combined$Sex == "male" &
+                                         combined$Title == "Master", 1,0))
+```
+
+In the dataset, 57% of young males survived, much better than the average survival rate of males
+
+```{r feature engineering 4}
+# Contrary to most males on the ship, younger males were more likely to survive 
+MM <- aggregate(Survived ~ Master.Male, 
+          data = combined, 
+          FUN = function(x) {sum(x)/length(x)})
+
+# multiply percent by 100
+MM$Survived <- MM$Survived*100
+# limit to 2 decimal places 
+MM <- MM %>% 
+  mutate_if(is.numeric, round, digits = 2)
+# create table 
+kable(MM) %>% 
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive", font_size = 8))
+```
+
+## 2.Prediction
+
+### Data set-up
+
+Before we implement machine learning, we need to do some basic set-up
+
+First, separate our data into test and train sets
+
+```{r test train, message=FALSE, warning=FALSE}
+train <- combined[1:891,] # # survived data
+test <- combined[892:1309,] # no survived data
+```
+
+Second, assess whether any data missing in our training set
+
+```{r missing values}
+sapply(train, function(x) sum(is.na(x)))
+```
+
+Third, worth an eye-ball of correlations between predictors
+
+```{r cor predictors}
+cor <- train 
+cor$PassengerId <- NULL
+cor <- round(cor(cor[,unlist(lapply(cor,is.numeric))]),2)
+lower <- cor
+lower[lower.tri(cor, diag=TRUE)]<-""
+lower <- as.data.frame(lower)
+kable(lower) %>% 
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive", font_size = 8))
+```
+
+Not surprisingly, predictors "family size" and "travel party size" are highly correlated, and as such should probably not be included together in any model to avoid multicollinearity
+
+Let's ensure these results can be replicated:
+
+```{r seed, message=FALSE, warning=FALSE}
+set.seed(2020)
+```
+
+The titanic data-set provides test (no survival status) and train (inc. survival status) data. In the absence of survival data in the test set, we have no means to compare our predicted values to actual values to evaluate model accuracy. Prediction accuracy is determined when submitting to Kaggle. As such, we can split the training set to get a (very) rough approximation of the models performance. With only a small number of cases, these results need to be interpreted with some trepidation
+
+```{r cross validation, message=FALSE, warning=FALSE}
+train$Survived <- factor(train$Survived)
+
+split = sample.split(train$Survived, SplitRatio = 0.8)
+train.cv = subset(train, split == TRUE)
+test.cv = subset(train, split == FALSE)
+```
+
+We are not ready to build & test our predictive model 
+
+### Model [1] Decision Tree
+
+Decision Trees operate by splitting the independent variables in our model (sex, age etc), such that they result in the *largest* possible reduction in heterogeneity of the dependent variable (i.e. survival status). In other words, how do the variables most strongly distinguish survivors from non-surivors? If literally zero males aged over 50 survived, this would be a split in the tree. Hetereogeneity is estimated in three popular ways: Entropy, Gini Index and Classification Error
+
+We will utilise the Recursive Partitioning And Regression Trees (rpart) package to implement this model, which splits the data via the *Gini Index*. The Gini Index measures the degree or probability of a particular variable being wrongly classified when it is randomly chosen
+
+This [informative blog on the topic](https://eight2late.wordpress.com/2016/02/16/a-gentle-introduction-to-decision-trees-using-r/) provides a more detailed overview
+
+A caveat is that the rpart algorithm works by making the *best possible choice/split at each particular stage*. This pays no mind to whether this decision remain optimal in future splits
+
+#### Build Tree based model
+
+The below snippet defines the dependent variable, independent variables & combines into a model 
+
+```{r tree models, results='hide', message=FALSE, warning=FALSE}
+# Outcome variable
+(DV <- "Survived")
+
+# Predictor variables Model [1]
+(IVs <- c("Pclass", "Sex", "Age", "SibSp", "Parch", "Fare", "Embarked", 
+          "Title", "Master.Male", "Female.Group"))
+
+# Create the formula string 
+(FMLA <- paste(DV, "~", paste(IVs, collapse = " + ")))
+
+# Create recipe of formula
+FMLA.Recipe <- recipe(Survived ~ Pclass + Sex + Age + SibSp + 
+                      Parch + Fare + Embarked +  Title + Master.Male +
+                      Female.Group, 
+                      data = train.cv)
+```
+
+#### Cross Validation of Decision Tree
+
+Utilising the split training data, let's assess the accuracy of this model 
+
+First, create cross validation folds, specifying parameters 
+
+```{r DT cross validation model 1}
+folds = createMultiFolds(train.cv$Survived, 
+                         k = 10, # number of folds
+                         times = 5) # number of partitions
+```
+
+Second, specify parameters for cross validation 
+
+```{r DT cross validation model 2}
+control <- trainControl(method = "repeatedcv", 
+                        index = folds,
+                        number = 6, 
+                        search = "grid")
+```
+
+Third, create model from cross validation data
+
+```{r DT cross validation model 3}
+# factorise
+train.cv$Survived <- factor(train.cv$Survived)
+
+tree.classifier.cv <- train(Survived ~ Pclass + Sex + Age + SibSp + Parch + Fare                             + Embarked + Title + Master.Male + Female.Group,  
+                       data = train.cv, 
+                       method = "rpart", 
+                       trControl = control)
+```
+
+Visualise cross validation tree
+
+```{r DT cross validation model 4}
+rpart.plot(tree.classifier.cv$finalModel, extra=4)
+```
+
+Decision Tree's are fairly intuitive to interpret. The far right leaf node (bottom of tree) can be interpreted as for non-survivors (blue) where sex == male, 81% perished. By contrast, for survivors (green) where sex != male (i.e. female) **and** cabin class == 1, 96% survived 
+
+Create list of predicted values
+
+```{r DT cross validation model 5}
+# Predicting the Validation set results
+y_predDT.CV = predict(tree.classifier.cv, 
+                      newdata = test.cv[,-which(names(test.cv) == "Survived")])
+```
+
+Create confusion matrix contrasting y actual versus y predicted values
+
+```{r DT cross validation model 6}
+# Checking the prediction accuracy
+table(test.cv$Survived, y_predDT.CV) # Confusion matrix
+```
+
+Create error estimate (where known survival status mismatches with predicted survival status)
+
+```{r DT cross validation model 7}
+# Check prediction accuracy 
+error <- mean(test.cv$Survived != y_predDT.CV) # Misclassification error
+```
+
+Calculate Accuracy as 1 minus error 
+
+```{r DT cross validation model 8}
+# 0.8258
+paste('Accuracy =', round(1 - error, 4))
+```
+
+The result of cross validation is an accuracy estimate of 0.8258. Put another way, ~ 83% of passengers survival status was correctly predicted by the model
+
+#### Final Model 
+
+We can repeat the previous steps on the full training set, ready to submit to Kaggle
+
+Create model 
+
+```{r DT submission 1}
+# Examine Decision Tree of model  
+tree <- rpart(FMLA,
+              data = train, 
+              method = "class",
+              control = rpart.control(minsplit = 20))
+```
+
+Plot the model 
+
+```{r DT submission 2}
+fancyRpartPlot(tree)
+```
+
+Not surprisingly, using the full training dataset has produced a more nuanced splitting of variables. The most heterogeneous split occurred for surviving passengers where 95% survived when title != "mr" or "other", and cabin class != third class 
+
+After reviewing this model, we can prepare the data for submission to Kaggle 
+
+```{r DT submission 4}
+PredictionDT <- predict(tree, 
+                        test, 
+                        type = "class")
+
+submitDT <- data.frame(PassengerId = test$PassengerId, 
+                       Survived = PredictionDT)
+
+write.csv(submitDT, file = "TitanicDT.csv", row.names = FALSE)
+```
+
+This submission produces a Kaggle accuracy score of 0.7790. Not bad, but not great, & some way off the cross-validation result of ~ 0.82
+
+Disparity between cross validated and submitted scores on the Titanic challenge is probably related to over-fitting of overly granular samples of data.
+
+Consider the below limitation of Decision Tree's articulated [in this blog](https://eight2late.wordpress.com/2016/02/16/a-gentle-introduction-to-decision-trees-using-r/) ... to quote:
+
+*An implication of their tendency to overfit data is that decision trees tend to be sensitive to relatively minor changes in the training datasets. Indeed, small differences can lead to radically different looking trees. Pruning addresses this to an extent, but does not resolve it completely. A better resolution is offered by the so-called ensemble methods* 
+
+The precise source of overfitting in the Titanic dataset is not limited to Decision Trees, & has been a common online discussion point. A discussion of this very issue & the role of variable *Sex* [can be found here](https://www.kaggle.com/c/titanic/discussion/53564) 
+
+All the same, ensemble methods better compensate for overfitting by averaging the result over *many trees*. With this in mind, let's try and improve upon our model with a Random Forest model - one of the more popular ensemble applications of Decision Trees
+
+### Model [2] Random Forest
+
+Random Forests are an ensemble method that builds upon a standard Decision Tree by building *a forest* of many trees. This is achieved by random sampling of training data points when building trees, & random selection of subsets of variables when splitting nodes. More info [here](https://eight2late.wordpress.com/2016/09/20/a-gentle-introduction-to-random-forests-using-r/)
+
+The use of multiple, random datasets to build trees is known as *bootstrap aggregating* (bagging). Each point in the dataset is equally likely to be chosen, & can appear multiple times in a subset. These bootstrap samples are then fed as training data to more Decision Tree's 
+
+The ultimate result of the random forest is determined by "bagging" 
+a majority vote from all the Decision Trees. This produces a primary statistical output, *out of bag error* which is equivalent to the number of correctly predicted rows from the out of bag sample
+
+For the remainder of this kernel we will use the Random Forest package, which implements [Breiman's random forest algorithm](https://www.rdocumentation.org/packages/randomForest/versions/4.6-14/topics/randomForest)
+
+#### Tuning & cross validation of Random Forest parameters 
+
+When performing a Random Forest, there are many parameters that can be controlled that are summarised in [this medium article](https://medium.com/@ammubharatram/hyperparameter-tuning-of-random-forest-in-both-r-and-python-747b06b568db) 
+
+For this kernel's purposes, we will focus on two:
+
+**mtry**: the number of variables randomly sampled as candidates at each split. The default value is the square root of the number of variables (*p*) 
+**ntree**: the number of trees to grow. Larger number of trees produce more stable models and covariate importance estimates. Too many trees can be surplus to requirements
+
+For tuning, I have shamelessly lifted a custom algorithm developed by Jason Brownlee in his excellent article covering [tuning of random forest models](https://machinelearningmastery.com/tune-machine-learning-algorithms-in-r/)
+
+```{r RF tuning 1}
+customRF <- list(type = "Classification", 
+                 library = "randomForest", 
+                 loop = NULL)
+
+customRF$parameters <- data.frame(parameter = c("mtry", "ntree"), 
+                                  class = rep("numeric", 2), 
+                                  label = c("mtry", "ntree"))
+
+customRF$grid <- function(x, y, 
+                          len = NULL, 
+                          search = "grid") {}
+
+customRF$fit <- function(x, y, 
+                         wts, 
+                         param, 
+                         lev, 
+                         last, 
+                         weights, 
+                         classProbs, ...) 
+  {
+  randomForest(x, y, 
+               mtry = param$mtry, 
+               ntree = param$ntree, ...)
+  }
+
+customRF$predict <- function(modelFit, newdata, preProc = NULL, submodels = NULL)
+  predict(modelFit, newdata)
+
+customRF$prob <- function(modelFit, newdata, preProc = NULL, submodels = NULL)
+  predict(modelFit, newdata, type = "prob")
+
+customRF$sort <- function(x) x[order(x[,1]),]
+
+customRF$levels <- function(x) x$classes
+```
+
+Now specify parameters to assess ... mtry between 1 & 5, & ntree between 1000 & 2500 in 500-tree increments. This step takes a little while to run so be patient :)
+
+``````{r RF tuning 2}
+# train model
+control <- trainControl(method = "repeatedcv", 
+                        number = 10, 
+                        repeats = 3)
+# specify tuning parameters for mtry & ntree
+tunegrid <- expand.grid(.mtry = c(1:5), 
+                        .ntree = c(1000, 1500, 2000, 2500))
+metric <- "Accuracy"
+
+# to complete random forest, must be a factor
+train.cv$Survived <- factor(train.cv$Survived)
+# recipe for formula
+rec <- recipe(Survived ~ Pclass + Sex + Age + SibSp + Parch + Fare + Embarked +  
+                Title + Master.Male + Female.Group, 
+              data = train.cv)
+
+# this is ~ 10 minutes to run  
+custom <- train(rec, 
+                data = train.cv, 
+                method = customRF, 
+                metric = metric, 
+                tuneGrid = tunegrid, 
+                trControl = control)
+```
+
+Tabulate the results of the above tuning
+
+```{r RF tuning 3}
+customdf <- as.data.frame(custom$results) %>% 
+  arrange(desc(Accuracy))
+
+kable(customdf) %>% 
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive", font_size = 8))
+```
+
+```{r rf tuning 4}
+plot(custom)
+```
+
+A number of noteworthy things ... 
+
+Firstly, parameters set to ntree == 2000 & mtry == 3 yielded the highest accuracy of 0.8298
+
+Secondly, the *Kappa* statistic ranged from 0.63 to 0.59 for all assessed combinations. The Kappa statistic is a metric comparing an observed Accuracy (i.e. attributable to the model) with an Expected Accuracy (random chance). 
+
+Kappa is a useful metric when a dataset is inbalanced (cf. [this link for definition of Kappa](https://stats.stackexchange.com/questions/82162/cohens-kappa-in-plain-english)). Although the titanic dataset isn't as unbalanced as say credit-card fraud (where vast majority of transaction data will be non-fradulent) more people perished than survived. 
+
+Although there is no consensus guidelines on intepreting Kappa, a score in the range of 0.60 is considered fair to good
+
+```{r RF tuning 5, results = 'hide', message=FALSE, warning=FALSE}
+RFCV <- randomForest(as.Formula(FMLA),
+                    data = train.cv, 
+                    importance = TRUE,
+                    index = folds,
+                    do.trace = T,
+                    mtry = 3,
+                    ntree = 2000)
+```
+
+Let's generate our predictions on the validation data
+
+```{r rf tuning 6}
+# Predicting the Validation set results
+y_predRF = predict(RFCV, 
+                   newdata = test.cv[,-which(names(test.cv)=="Survived")],
+                   type='class')
+```
+
+Then create a confusion matrix that contrasts y actual with y predicted values from the test dataset
+
+```{r rf tuning 7}
+# Checking the prediction accuracy
+table(test.cv$Survived, y_predRF) # Confusion matrix
+```
+
+Create error estimate (where known survival status mismatches with predicted survival status), then subtract from 1 for overall error score 
+
+```{r random forest tuning 9}
+# Check prediction accuracy 
+error <- mean(test.cv$Survived != y_predDT.CV) # Misclassification error
+
+paste('Accuracy',round(1-error,4))
+```
+
+Provides a model accuracy of 0.8258 - not too bad
+
+Let's repeat these steps on our full training dataset, & prepare for submission to Kaggle 
+
+#### Final Model 
+
+```{r create RF model, results = 'hide', message=FALSE, warning=FALSE}
+train$Survived <- factor(train$Survived)
+RF <- randomForest(as.Formula(FMLA),
+                     data = train, 
+                     importance = TRUE,
+                     do.trace = T,
+                     mtry = 3,
+                     ntree = 2000)
+```
+
+Print the details of model provides the out of bag error estimate. As discussed, this is the mean prediction error on each training sample xᵢ, and provides an error estimate of 15.71%
+
+```{r create RF model 2}
+print(RF)
+```
+
+Let's now plot variable importance from this model:
+
+```{r create RF model 3}
+varImpPlot(RF)
+```
+
+This plot provides two metrics
+
+Firstly, **Mean Decrease Accuracy** which assesses the observed reduction in model performance without each variable. In other words, a big decrease in model accuracy would be anticipated for strong predictors
+
+Secondly, **Mean Decrease GINI**  measures how pure the nodes are at the end of the tree. It is similarly an assessment to evaluate model performance if each variable is taken out. A high score indicates higher variable importance
+
+In this model, Fare, Title, Class & Sex appear to be among the strongest predictors 
+
+Let's now plot error rates
+
+```{r create RF model 4}
+plot(RF)
+```
+
+The error plot is useful to evaluate model performance against the number of trees. The coloured lines represent our predicted classes of survived (green) or perished (red), whilst the black represents out of bag samples . It clearly shows a steep reduction in error over the first 100 or so trees which stabilises with more smaller improvements in error rate observed up to 2000 trees
+
+Finally, let's complete a Receiver Operating Characteristics (ROC) plot 
+
+```{r create RF model 5, message=FALSE, warning=FALSE}
+rf.roc <- roc(train$Survived,RF$votes[,2])
+plot(rf.roc)
+```
+
+```{r create RF model 6}
+auc(rf.roc)
+```
+
+The ROC curve plots true-positive rates (y axis, sensitivity) against false positive rates (x axis, specificity)
+
+When two distributions overlap, (i.e. variance of surived & perished passengers), we introduce type 1 and type 2 error. Depending upon the threshold, such error rates can be minimised or maximised. An AUC score of 0.88 indicates an ~ 88% chance this model will be able to distinguish between survivors and non-survivors. More information on ROC plots can be found [here](https://towardsdatascience.com/understanding-auc-roc-curve-68b2303cc9c5)
+
+Once satisfied with our model and its output, we can bind our predicted survival values to the Passenger IDs of the test set, & convert to a .csv file to export 
+
+```{r create RF model 7}
+conf <- RF$confusion
+RF$confusion[, 'class.error']
+PredictionRF <- predict(RF, test)
+submitRF <- data.frame(PassengerId = test$PassengerId,
+                           SurvivedRF = PredictionRF)
+write.csv(submitRF, file = "TitanicRF.csv", row.names = FALSE)
+```
+
+Submitting this file to Kaggle resulted in an overall score of  **0.80382**
